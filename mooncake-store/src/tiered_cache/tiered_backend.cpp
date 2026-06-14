@@ -11,6 +11,7 @@
 #endif
 #include "tiered_cache/tiers/storage_tier.h"
 #include "tiered_cache/scheduler/client_scheduler.h"
+#include "tiered_cache/scheduler/scheduler_events.h"
 #include "utils.h"
 
 namespace mooncake {
@@ -431,8 +432,8 @@ tl::expected<AllocationHandle, ErrorCode> TieredBackend::Allocate(
         // Failed - try sync eviction if available
         if (scheduler_ &&
             alloc_result.error() == ErrorCode::NO_AVAILABLE_HANDLE) {
-            bool evicted =
-                scheduler_->OnAllocationFailure(*preferred_tier, size);
+            bool evicted = scheduler_->OnAllocationFailure(
+                AllocationFailureContext{*preferred_tier, size});
             if (evicted) {
                 // Retry after eviction
                 alloc_result = it->second->Allocate(size, loc.data);
@@ -474,7 +475,8 @@ tl::expected<AllocationHandle, ErrorCode> TieredBackend::Allocate(
             evict_tier_id = sorted[0];
         }
 
-        bool evicted = scheduler_->OnAllocationFailure(evict_tier_id, size);
+        bool evicted = scheduler_->OnAllocationFailure(
+            AllocationFailureContext{evict_tier_id, size});
         if (evicted) {
             // Retry allocation after eviction
             alloc_result = AllocateInternalRaw(size, preferred_tier, &loc);
@@ -605,9 +607,13 @@ tl::expected<void, ErrorCode> TieredBackend::Commit(
     }
 
     if (scheduler_) {
-        scheduler_->OnCommit(key, current_tier_id, handle_size);
+        scheduler_->OnCommit(CommitContext{key, current_tier_id, handle_size});
         if (record_access) {
-            scheduler_->OnAccess(key);
+            // Commit is a write, not a cache hit: routed as kCommit so the
+            // scheduler neither counts frequency nor schedules offload/onboard.
+            scheduler_->OnAccess(AccessContext{key, AccessOrigin::kCommit,
+                                               std::nullopt,
+                                               MemoryType::UNKNOWN});
         }
     }
 
@@ -648,35 +654,55 @@ tl::expected<AllocationHandle, ErrorCode> TieredBackend::Get(
         entry = it->second;
     }
 
-    if (record_access && scheduler_) {
-        scheduler_->OnAccess(key);
-    }
+    // Read Entry (Entry Read Lock): pick the replica that will serve this Get.
+    AllocationHandle served_handle;
+    UUID served_tier_id;
+    {
+        std::shared_lock<std::shared_mutex> entry_read_lock(entry->mutex);
 
-    // Read Entry (Entry Read Lock)
-    std::shared_lock<std::shared_mutex> entry_read_lock(entry->mutex);
-
-    // Return current version if requested
-    if (out_version) {
-        *out_version = entry->version;
-    }
-
-    if (entry->replicas.empty()) {
-        LOG(ERROR) << "Empty replicas for key: " << key;
-        return tl::make_unexpected(ErrorCode::EMPTY_REPLICAS);
-    }
-
-    if (tier_id.has_value()) {
-        for (const auto& replica : entry->replicas) {
-            if (replica.first == *tier_id) {
-                return replica.second;
-            }
+        // Return current version if requested
+        if (out_version) {
+            *out_version = entry->version;
         }
-        LOG(ERROR) << "Tier not found: " << *tier_id;
-        return tl::make_unexpected(ErrorCode::TIER_NOT_FOUND);
+
+        if (entry->replicas.empty()) {
+            LOG(ERROR) << "Empty replicas for key: " << key;
+            return tl::make_unexpected(ErrorCode::EMPTY_REPLICAS);
+        }
+
+        if (tier_id.has_value()) {
+            for (const auto& replica : entry->replicas) {
+                if (replica.first == *tier_id) {
+                    served_handle = replica.second;
+                    served_tier_id = replica.first;
+                    break;
+                }
+            }
+            if (!served_handle) {
+                LOG(ERROR) << "Tier not found: " << *tier_id;
+                return tl::make_unexpected(ErrorCode::TIER_NOT_FOUND);
+            }
+        } else {
+            // Fallback: highest priority replica.
+            served_handle = entry->replicas.begin()->second;
+            served_tier_id = entry->replicas.begin()->first;
+        }
     }
 
-    // Fallback: Return highest priority replica
-    return entry->replicas.begin()->second;
+    // Report the access tagged with the tier that actually served it, so the
+    // scheduler can route offload (DRAM hit) / onboard (slow-tier hit). Done
+    // outside the entry lock; tiers_ is immutable after Init.
+    if (record_access && scheduler_) {
+        MemoryType served_type = MemoryType::UNKNOWN;
+        auto tier_it = tiers_.find(served_tier_id);
+        if (tier_it != tiers_.end() && tier_it->second) {
+            served_type = tier_it->second->GetMemoryType();
+        }
+        scheduler_->OnAccess(AccessContext{key, AccessOrigin::kGet,
+                                           served_tier_id, served_type});
+    }
+
+    return served_handle;
 }
 
 bool TieredBackend::Exist(std::string_view key,
@@ -773,7 +799,7 @@ tl::expected<void, ErrorCode> TieredBackend::Delete(std::string_view key,
 
         if (found_tier) {
             if (scheduler_) {
-                scheduler_->OnDelete(key, *tier_id);
+                scheduler_->OnDelete(DeleteContext{key, *tier_id});
             }
             return tl::expected<void, ErrorCode>{};
         } else {
@@ -820,7 +846,7 @@ tl::expected<void, ErrorCode> TieredBackend::Delete(std::string_view key,
     // Ref count drops to 0 -> ~AllocationEntry() -> Free().
     // This happens concurrently without holding any locks.
     if (scheduler_) {
-        scheduler_->OnDelete(key, std::nullopt);
+        scheduler_->OnDelete(DeleteContext{key, std::nullopt});
     }
     return tl::expected<void, ErrorCode>{};
 }
@@ -874,7 +900,7 @@ tl::expected<long, ErrorCode> TieredBackend::RemoveAll() {
             }
 
             if (scheduler_) {
-                scheduler_->OnDelete(key, std::nullopt);
+                scheduler_->OnDelete(DeleteContext{key, std::nullopt});
             }
 
             ++total_removed;

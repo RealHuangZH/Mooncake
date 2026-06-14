@@ -1271,4 +1271,166 @@ TEST_F(SchedulerIntegrationTest, SingleTierEviction) {
     LOG(INFO) << "Single-tier eviction test completed";
 }
 
+// =====================  MULTI_LRU (event-driven)  =====================
+
+namespace {
+
+UUID FindTier(TieredBackend& backend, MemoryType type) {
+    for (const auto& v : backend.GetTierViews()) {
+        if (v.type == type) return v.id;
+    }
+    return UUID{};
+}
+
+void WriteKey(TieredBackend& backend, const std::string& key, UUID tier_id,
+              size_t size, char fill) {
+    auto handle = backend.Allocate(size, tier_id);
+    ASSERT_TRUE(handle.has_value());
+    auto buffer = std::make_unique<char[]>(size);
+    std::memset(buffer.get(), fill, size);
+    DataSource source{
+        std::make_unique<TempDRAMBuffer>(std::move(buffer), size),
+        MemoryType::DRAM};
+    ASSERT_TRUE(backend.Write(source, handle.value()).has_value());
+    ASSERT_TRUE(backend.Commit(key, handle.value()).has_value());
+}
+
+bool HasReplicaOn(TieredBackend& backend, const std::string& key, UUID tier) {
+    auto replicas = backend.GetReplicaTierIds(key);
+    return std::find(replicas.begin(), replicas.end(), tier) != replicas.end();
+}
+
+}  // namespace
+
+// A hot DRAM key is replicated (offloaded) to the storage tier while keeping
+// the DRAM copy.
+TEST_F(SchedulerIntegrationTest, MultiLRUOffloadsHotDramKey) {
+    config_["scheduler"]["policy"] = "MULTI_LRU";
+    config_["scheduler"]["offload_freq_threshold"] = 1;
+    config_["scheduler"]["onboard_freq_threshold"] = 1000000;  // no onboard
+    config_["scheduler"]["loop_interval_ms"] = 50;
+
+    TieredBackend backend;
+    ASSERT_TRUE(InitTieredBackendForTest(backend, config_).has_value());
+    const UUID dram_id = FindTier(backend, MemoryType::DRAM);
+    const UUID storage_id = FindTier(backend, MemoryType::NVME);
+
+    const std::string key = "hot_dram";
+    WriteKey(backend, key, dram_id, 4096, 'H');
+    ASSERT_TRUE(HasReplicaOn(backend, key, dram_id));
+    ASSERT_FALSE(HasReplicaOn(backend, key, storage_id));
+
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    bool offloaded = false;
+    while (std::chrono::steady_clock::now() < deadline) {
+        for (int i = 0; i < 10; ++i) backend.Get(key);  // DRAM hits → offload
+        if (HasReplicaOn(backend, key, storage_id)) {
+            offloaded = true;
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    EXPECT_TRUE(offloaded) << "hot DRAM key should be offloaded to storage";
+    EXPECT_TRUE(HasReplicaOn(backend, key, dram_id))
+        << "offload (REPLICATE) must keep the DRAM copy";
+}
+
+// A hot storage key is promoted (onboarded) to DRAM and its storage copy is
+// removed (move semantics). Offload is disabled so it cannot reappear.
+TEST_F(SchedulerIntegrationTest, MultiLRUOnboardsHotStorageKey) {
+    config_["scheduler"]["policy"] = "MULTI_LRU";
+    config_["scheduler"]["onboard_freq_threshold"] = 2;
+    config_["scheduler"]["offload_freq_threshold"] = 1000000;  // no offload
+    config_["scheduler"]["loop_interval_ms"] = 50;
+
+    TieredBackend backend;
+    ASSERT_TRUE(InitTieredBackendForTest(backend, config_).has_value());
+    const UUID dram_id = FindTier(backend, MemoryType::DRAM);
+    const UUID storage_id = FindTier(backend, MemoryType::NVME);
+
+    const std::string key = "hot_storage";
+    WriteKey(backend, key, storage_id, 4096, 'S');
+    ASSERT_TRUE(HasReplicaOn(backend, key, storage_id));
+    ASSERT_FALSE(HasReplicaOn(backend, key, dram_id));
+
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    bool onboarded = false;
+    while (std::chrono::steady_clock::now() < deadline) {
+        for (int i = 0; i < 10; ++i) backend.Get(key);  // SSD hits → onboard
+        if (HasReplicaOn(backend, key, dram_id)) {
+            onboarded = true;
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    EXPECT_TRUE(onboarded) << "hot storage key should be onboarded to DRAM";
+
+    // Give the move's source-delete a moment, then verify the SSD copy is gone.
+    const auto move_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (std::chrono::steady_clock::now() < move_deadline &&
+           HasReplicaOn(backend, key, storage_id)) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    EXPECT_FALSE(HasReplicaOn(backend, key, storage_id))
+        << "onboard (MIGRATE) must delete the storage copy";
+}
+
+// Background eviction brings an over-watermark DRAM tier back down.
+TEST_F(SchedulerIntegrationTest, MultiLRUBackgroundEvictionReducesUsage) {
+    config_["scheduler"]["policy"] = "MULTI_LRU";
+    config_["scheduler"]["loop_interval_ms"] = 50;
+    config_["scheduler"]["evict_watermark"] = 0.85;
+    config_["scheduler"]["evict_watermark_floor"] = 0.80;
+    config_["scheduler"]["limit_watermark"] = 0.95;
+    config_["scheduler"]["low_watermark"] = 0.60;
+    config_["scheduler"]["evict_rate_max"] = 0.25;
+    // Offload first so DRAM-resident keys gain a storage replica that eviction
+    // can cheaply drop.
+    config_["scheduler"]["offload_freq_threshold"] = 1;
+    config_["scheduler"]["onboard_freq_threshold"] = 1000000;
+
+    TieredBackend backend;
+    ASSERT_TRUE(InitTieredBackendForTest(backend, config_).has_value());
+    const UUID dram_id = FindTier(backend, MemoryType::DRAM);
+
+    size_t dram_capacity = 0;
+    for (const auto& v : backend.GetTierViews()) {
+        if (v.id == dram_id) dram_capacity = v.capacity;
+    }
+    ASSERT_GT(dram_capacity, 0u);
+
+    // Fill DRAM to ~94% and touch every key so it enters the MultiLRU.
+    const size_t item_size = 256 * 1024;
+    const int fill_count =
+        static_cast<int>((dram_capacity * 0.94) / item_size);
+    for (int i = 0; i < fill_count; ++i) {
+        WriteKey(backend, "evk_" + std::to_string(i), dram_id, item_size, 'E');
+    }
+    for (int round = 0; round < 3; ++round) {
+        for (int i = 0; i < fill_count; ++i) backend.Get("evk_" +
+                                                          std::to_string(i));
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+
+    double final_usage = 1.0;
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(8);
+    while (std::chrono::steady_clock::now() < deadline) {
+        for (const auto& v : backend.GetTierViews()) {
+            if (v.id == dram_id) {
+                final_usage = static_cast<double>(v.usage) / v.capacity;
+            }
+        }
+        if (final_usage <= 0.90) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    LOG(INFO) << "DRAM usage after background eviction: " << final_usage * 100
+              << "%";
+    EXPECT_LE(final_usage, 0.92)
+        << "background eviction should pull DRAM back toward the watermark";
+}
+
 }  // namespace mooncake

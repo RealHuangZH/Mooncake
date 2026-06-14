@@ -3,9 +3,12 @@
 #include "tiered_cache/tiers/cache_tier.h"
 #include "tiered_cache/scheduler/lru_policy.h"
 #include "tiered_cache/scheduler/lru_stats_collector.h"
+#include "tiered_cache/scheduler/multi_lru_policy.h"
 #include "tiered_cache/scheduler/simple_policy.h"
+#include "tiered_cache/scheduler/tinylfu_stats_collector.h"
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <functional>
 #include <unordered_set>
 #include <glog/logging.h>
@@ -57,7 +60,103 @@ ClientScheduler::ClientScheduler(TieredBackend* backend,
         if (v > 0) loop_interval_ms_ = v;
     }
 
-    if (policy_type == "LRU") {
+    if (config.isMember("scheduler")) {
+        const auto& sched = config["scheduler"];
+        if (sched.isMember("async_pool_threads")) {
+            const auto v = sched["async_pool_threads"].asUInt64();
+            if (v > 0) async_pool_threads_ = static_cast<size_t>(v);
+        }
+        if (sched.isMember("offload_queue_capacity")) {
+            const auto v = sched["offload_queue_capacity"].asUInt64();
+            if (v > 0) offload_queue_capacity_ = static_cast<size_t>(v);
+        }
+        if (sched.isMember("onboard_queue_capacity")) {
+            const auto v = sched["onboard_queue_capacity"].asUInt64();
+            if (v > 0) onboard_queue_capacity_ = static_cast<size_t>(v);
+        }
+    }
+
+    if (policy_type == "MULTI_LRU") {
+        const auto& sched = config["scheduler"];
+
+        // Frequency-aware stats collector (TinyLFU + 4-level MultiLRU).
+        MultiLRUStatsCollector::Config collector_cfg;
+        collector_cfg.shard_count = stats_shards;
+        collector_cfg.max_snapshot_keys = stats_snapshot_limit_;
+        if (sched.isMember("tinylfu_sample_window")) {
+            const auto v = sched["tinylfu_sample_window"].asUInt64();
+            if (v > 0) collector_cfg.sample_window = static_cast<size_t>(v);
+        }
+        constexpr size_t kBuckets = MultiLRUStatsCollector::kNumBuckets;
+        if (sched.isMember("multi_lru_thresholds") &&
+            sched["multi_lru_thresholds"].isArray() &&
+            sched["multi_lru_thresholds"].size() == kBuckets) {
+            for (Json::ArrayIndex i = 0; i < kBuckets; ++i) {
+                collector_cfg.thresholds[i] =
+                    sched["multi_lru_thresholds"][i].asUInt64();
+            }
+        }
+        auto collector =
+            std::make_unique<MultiLRUStatsCollector>(collector_cfg);
+        multi_lru_collector_ = collector.get();
+        stats_collector_ = std::move(collector);
+
+        // Event-driven policy fed by the collector + a residency provider.
+        MultiLRUPolicy::Config policy_cfg;
+        if (sched.isMember("offload_freq_threshold")) {
+            policy_cfg.offload_freq_threshold =
+                sched["offload_freq_threshold"].asUInt64();
+        }
+        if (sched.isMember("onboard_freq_threshold")) {
+            policy_cfg.onboard_freq_threshold =
+                sched["onboard_freq_threshold"].asUInt64();
+        }
+        if (sched.isMember("onboard_dram_watermark")) {
+            policy_cfg.onboard_dram_watermark =
+                sched["onboard_dram_watermark"].asDouble();
+        }
+        auto multi_policy = std::make_unique<MultiLRUPolicy>(policy_cfg);
+        multi_policy->SetCollector(multi_lru_collector_);
+        multi_policy->SetKeyContextProvider(
+            [this](std::string_view key) { return SnapshotKeyContext(key); });
+        policy_ = std::move(multi_policy);
+
+        // Background eviction watermarks / rate limiting.
+        if (sched.isMember("evict_watermark")) {
+            evict_watermark_ = sched["evict_watermark"].asDouble();
+        }
+        if (sched.isMember("evict_watermark_floor")) {
+            evict_watermark_floor_ = sched["evict_watermark_floor"].asDouble();
+        }
+        if (sched.isMember("limit_watermark")) {
+            limit_watermark_ = sched["limit_watermark"].asDouble();
+        }
+        if (sched.isMember("low_watermark")) {
+            low_watermark_ = sched["low_watermark"].asDouble();
+        }
+        if (sched.isMember("evict_rate_min")) {
+            evict_rate_min_ = sched["evict_rate_min"].asDouble();
+        }
+        if (sched.isMember("evict_rate_max")) {
+            evict_rate_max_ = sched["evict_rate_max"].asDouble();
+        }
+        if (sched.isMember("evict_rate_gain")) {
+            evict_rate_gain_ = sched["evict_rate_gain"].asDouble();
+        }
+        // Sanity: low <= floor <= watermark < limit (keep clamp ranges valid).
+        const double below_limit = std::nextafter(limit_watermark_, 0.0);
+        evict_watermark_floor_ =
+            std::clamp(evict_watermark_floor_, 0.0, below_limit);
+        evict_watermark_ =
+            std::clamp(evict_watermark_, evict_watermark_floor_, below_limit);
+        low_watermark_ =
+            std::clamp(low_watermark_, 0.0, evict_watermark_floor_);
+        LOG(INFO) << "ClientScheduler initialized with MultiLRU Policy"
+                  << " (evict_watermark=" << evict_watermark_
+                  << ", floor=" << evict_watermark_floor_
+                  << ", limit=" << limit_watermark_
+                  << ", low=" << low_watermark_ << ")";
+    } else if (policy_type == "LRU") {
         // Initialize LRU components
         stats_collector_ = std::make_unique<LRUStatsCollector>(
             stats_shards, stats_snapshot_limit_);
@@ -97,6 +196,24 @@ ClientScheduler::ClientScheduler(TieredBackend* backend,
         policy_ = std::move(simple_policy);
         LOG(INFO) << "ClientScheduler initialized with Simple Policy";
     }
+
+    // Detect whether the policy is event-driven (implements the
+    // EventDrivenPolicy mixin). If so, build the shared async pool and the
+    // bounded de-dup queues that back offload/onboard. Periodic-only policies
+    // (Simple/LRU) leave this infrastructure null.
+    event_policy_ = dynamic_cast<EventDrivenPolicy*>(policy_.get());
+    if (event_policy_) {
+        offload_onboard_pool_ =
+            std::make_unique<ThreadPool>(async_pool_threads_);
+        offload_inflight_ =
+            std::make_unique<BoundedDedupQueue>(offload_queue_capacity_);
+        onboard_inflight_ =
+            std::make_unique<BoundedDedupQueue>(onboard_queue_capacity_);
+        LOG(INFO) << "ClientScheduler async offload/onboard pool started with "
+                  << async_pool_threads_ << " thread(s), offload_cap="
+                  << offload_queue_capacity_
+                  << ", onboard_cap=" << onboard_queue_capacity_;
+    }
 }
 
 ClientScheduler::~ClientScheduler() { Stop(); }
@@ -112,6 +229,16 @@ void ClientScheduler::RegisterTier(CacheTier* tier) {
             LOG(INFO) << "Set Fast Tier to " << tier->GetTierId();
         }
     }
+
+    // First NVME tier is the offload/onboard slow tier for event-driven mode.
+    if (tier->GetMemoryType() == MemoryType::NVME &&
+        !slow_tier_id_.has_value()) {
+        slow_tier_id_ = tier->GetTierId();
+        if (event_policy_) {
+            event_policy_->SetSlowTier(tier->GetTierId());
+        }
+        LOG(INFO) << "Set Slow Tier to " << tier->GetTierId();
+    }
 }
 
 void ClientScheduler::Start() {
@@ -122,15 +249,42 @@ void ClientScheduler::Start() {
 
 void ClientScheduler::Stop() {
     running_ = false;
+    // Drain and join the async pool BEFORE the worker thread so no offload/
+    // onboard task can touch the backend after teardown begins.
+    if (offload_onboard_pool_) {
+        offload_onboard_pool_->stop();
+    }
     cv_.notify_all();  // Wake the worker thread immediately.
     if (worker_thread_.joinable()) {
         worker_thread_.join();
     }
 }
 
-void ClientScheduler::OnAccess(std::string_view key) {
+void ClientScheduler::OnAccess(const AccessContext& ctx) {
+    // Only reads (Get hits) count towards frequency. Commits are writes, not
+    // cache hits, so they neither bump frequency nor route offload/onboard.
+    if (ctx.origin != AccessOrigin::kGet) {
+        return;
+    }
     if (stats_collector_) {
-        stats_collector_->RecordAccess(key);
+        stats_collector_->RecordAccess(ctx.key);
+    }
+
+    // Event-driven routing: the hook only enqueues (cheap, droppable). The
+    // policy decides whether to act and the consumer re-validates before any
+    // I/O — see ProcessOffload/ProcessOnboard.
+    if (!event_policy_) {
+        return;
+    }
+    switch (ctx.served_tier_type) {
+        case MemoryType::DRAM:
+            EnqueueOffload(ctx.key);  // hot DRAM key → replicate down to SSD
+            break;
+        case MemoryType::NVME:
+            EnqueueOnboard(ctx.key);  // hot SSD key → promote up to DRAM
+            break;
+        default:
+            break;
     }
 }
 
@@ -141,28 +295,37 @@ AccessStats ClientScheduler::GetHotKeyStats() const {
     return {};
 }
 
-void ClientScheduler::OnCommit(std::string_view key, UUID tier_id,
-                               size_t size_bytes) {
-    auto& shard = GetKeyCacheShard(key);
-    MutexLocker lock(&shard.mutex);
-    TrackReplicaLocked(shard, key, tier_id, size_bytes);
+void ClientScheduler::OnCommit(const CommitContext& ctx) {
+    {
+        auto& shard = GetKeyCacheShard(ctx.key);
+        MutexLocker lock(&shard.mutex);
+        TrackReplicaLocked(shard, ctx.key, ctx.tier_id, ctx.size_bytes);
+    }
+    // Track fast-tier write load for the dynamic evict watermark. fast_tier_id_
+    // is fixed during RegisterTier (before any commits), so this read is safe.
+    if (event_policy_ && fast_tier_id_.has_value() &&
+        ctx.tier_id == *fast_tier_id_) {
+        committed_bytes_this_cycle_.fetch_add(ctx.size_bytes,
+                                              std::memory_order_relaxed);
+    }
 }
 
-void ClientScheduler::OnDelete(std::string_view key,
-                               std::optional<UUID> tier_id) {
+void ClientScheduler::OnDelete(const DeleteContext& ctx) {
     bool remove_stats = false;
     {
-        auto& shard = GetKeyCacheShard(key);
+        auto& shard = GetKeyCacheShard(ctx.key);
         MutexLocker lock(&shard.mutex);
-        remove_stats = RemoveReplicaLocked(shard, key, tier_id);
+        remove_stats = RemoveReplicaLocked(shard, ctx.key, ctx.tier_id);
     }
 
     if (remove_stats && stats_collector_) {
-        stats_collector_->RemoveKey(key);
+        stats_collector_->RemoveKey(ctx.key);
     }
 }
 
-bool ClientScheduler::OnAllocationFailure(UUID tier_id, size_t required_bytes) {
+bool ClientScheduler::OnAllocationFailure(const AllocationFailureContext& ctx) {
+    const UUID tier_id = ctx.tier_id;
+    const size_t required_bytes = ctx.required_bytes;
     if (TryFastReclaim(tier_id, required_bytes)) {
         LOG(INFO) << "Allocation failed on tier " << tier_id
                   << ", reclaimed pre-replicated cold replicas";
@@ -180,6 +343,245 @@ bool ClientScheduler::OnAllocationFailure(UUID tier_id, size_t required_bytes) {
     }
 }
 
+std::optional<KeyContext> ClientScheduler::SnapshotKeyContext(
+    std::string_view key) const {
+    const auto& shard = GetKeyCacheShard(key);
+    MutexLocker lock(&shard.mutex);
+    auto it = shard.key_cache.find(key);
+    if (it == shard.key_cache.end() || it->second.current_locations.empty()) {
+        return std::nullopt;
+    }
+    KeyContext ctx;
+    ctx.key = std::string(key);
+    ctx.current_locations = it->second.current_locations;
+    ctx.size_bytes = it->second.size_bytes;
+    return ctx;
+}
+
+void ClientScheduler::EnqueueOffload(std::string_view key) {
+    if (!offload_inflight_ || !offload_onboard_pool_) return;
+    if (!offload_inflight_->TryAdmit(key)) return;  // dup or full → drop
+    std::string k(key);
+    try {
+        offload_onboard_pool_->enqueue(
+            [this, k]() mutable { ProcessOffload(std::move(k)); });
+    } catch (const std::exception&) {
+        // Pool already stopped — release the slot we just reserved.
+        offload_inflight_->MarkDone(key);
+    }
+}
+
+void ClientScheduler::EnqueueOnboard(std::string_view key) {
+    if (!onboard_inflight_ || !offload_onboard_pool_) return;
+    if (!onboard_inflight_->TryAdmit(key)) return;  // dup or full → drop
+    std::string k(key);
+    try {
+        offload_onboard_pool_->enqueue(
+            [this, k]() mutable { ProcessOnboard(std::move(k)); });
+    } catch (const std::exception&) {
+        onboard_inflight_->MarkDone(key);
+    }
+}
+
+void ClientScheduler::ProcessOffload(std::string key) {
+    // Release the in-flight slot on every exit path.
+    struct SlotGuard {
+        BoundedDedupQueue* queue;
+        const std::string& key;
+        ~SlotGuard() {
+            if (queue) queue->MarkDone(key);
+        }
+    } guard{offload_inflight_.get(), key};
+
+    if (!running_.load() || !event_policy_ || !backend_ ||
+        !fast_tier_id_.has_value()) {
+        return;
+    }
+
+    auto ctx = SnapshotKeyContext(key);
+    if (!ctx.has_value()) return;
+
+    const auto tier_stats = CollectTierStats();
+    const OffloadDecision decision = event_policy_->Offload(*ctx, tier_stats);
+    if (!decision.perform) return;
+    const UUID target = decision.target_tier;
+
+    // Re-validate against the authoritative backend state: the key must still
+    // live on the fast tier and must not already have a target replica. This
+    // discards events made stale by a concurrent delete/migrate/rewrite.
+    if (!backend_->Exist(key, *fast_tier_id_)) return;
+    if (backend_->Exist(key, target)) return;
+
+    uint64_t version = 0;
+    auto source =
+        backend_->Get(key, *fast_tier_id_, /*record_access=*/false, &version);
+    if (!source.has_value()) return;
+
+    // offload == REPLICATE: copy to the slow tier with version CAS, keeping
+    // the fast copy. A stale version or a full target fails the CAS harmlessly.
+    auto res = backend_->CopyData(key, source.value()->loc.data, target,
+                                  version, /*record_access=*/false);
+    if (!res.has_value() && res.error() != ErrorCode::CAS_FAILED &&
+        res.error() != ErrorCode::NO_AVAILABLE_HANDLE) {
+        VLOG(2) << "Offload copy failed for key " << key
+                << ", error: " << res.error();
+    }
+}
+
+void ClientScheduler::ProcessOnboard(std::string key) {
+    struct SlotGuard {
+        BoundedDedupQueue* queue;
+        const std::string& key;
+        ~SlotGuard() {
+            if (queue) queue->MarkDone(key);
+        }
+    } guard{onboard_inflight_.get(), key};
+
+    if (!running_.load() || !event_policy_ || !backend_ ||
+        !fast_tier_id_.has_value() || !slow_tier_id_.has_value()) {
+        return;
+    }
+
+    auto ctx = SnapshotKeyContext(key);
+    if (!ctx.has_value()) return;
+
+    const auto tier_stats = CollectTierStats();
+    const OnboardDecision decision = event_policy_->Onboard(*ctx, tier_stats);
+    if (!decision.perform) return;
+    const UUID fast = decision.target_tier;
+    const UUID slow = *slow_tier_id_;
+
+    // Re-validate: still resident on the slow tier and not already promoted.
+    if (backend_->Exist(key, fast)) return;
+    if (!backend_->Exist(key, slow)) return;
+
+    // onboard == MIGRATE: Transfer copies slow → fast with version CAS; on
+    // success we drop the slow replica to complete the move.
+    auto res = backend_->Transfer(key, slow, fast, /*record_access=*/false);
+    if (!res.has_value()) {
+        if (res.error() != ErrorCode::CAS_FAILED &&
+            res.error() != ErrorCode::NO_AVAILABLE_HANDLE) {
+            VLOG(2) << "Onboard transfer failed for key " << key
+                    << ", error: " << res.error();
+        }
+        return;
+    }
+
+    auto del = backend_->Delete(key, slow);
+    if (!del.has_value() && del.error() != ErrorCode::OBJECT_NOT_FOUND &&
+        del.error() != ErrorCode::TIER_NOT_FOUND) {
+        VLOG(2) << "Onboard source cleanup failed for key " << key
+                << ", error: " << del.error();
+    }
+}
+
+void ClientScheduler::RunBackgroundEvictCycle() {
+    if (!event_policy_ || !fast_tier_id_.has_value() ||
+        !offload_onboard_pool_) {
+        return;
+    }
+
+    // 1. Write load for this cycle (bytes/sec) from accumulated fast-tier
+    //    commits, read-and-reset atomically.
+    const size_t committed =
+        committed_bytes_this_cycle_.exchange(0, std::memory_order_relaxed);
+    const double interval_s =
+        loop_interval_ms_ > 0 ? loop_interval_ms_ / 1000.0 : 1.0;
+    const double write_rate = static_cast<double>(committed) / interval_s;
+
+    // 2. Fast-tier usage.
+    const auto tier_stats = CollectTierStats();
+    auto it = tier_stats.find(*fast_tier_id_);
+    if (it == tier_stats.end() || it->second.total_capacity_bytes == 0) {
+        return;
+    }
+    const size_t capacity = it->second.total_capacity_bytes;
+    const size_t used = it->second.used_capacity_bytes;
+    const double usage =
+        static_cast<double>(used) / static_cast<double>(capacity);
+
+    // 3. Dynamic watermark + trigger check.
+    const double watermark = ComputeDynamicEvictWatermark(write_rate, capacity);
+    if (usage <= watermark) {
+        return;
+    }
+
+    // 4. Proportional reclaim budget for this cycle.
+    const size_t target =
+        ComputeReclaimTarget(usage, watermark, capacity, used);
+    if (target == 0) {
+        return;
+    }
+
+    // 5. Post a single eviction task to the shared pool (non-blocking). The
+    //    in-flight guard keeps cycles from stacking eviction tasks.
+    bool expected = false;
+    if (!evict_in_flight_.compare_exchange_strong(expected, true)) {
+        return;
+    }
+    try {
+        offload_onboard_pool_->enqueue([this, tier_stats, target]() {
+            struct ClearFlag {
+                std::atomic<bool>* flag;
+                ~ClearFlag() { flag->store(false, std::memory_order_relaxed); }
+            } clear_on_exit{&evict_in_flight_};
+            if (!running_.load() || !event_policy_) return;
+            auto actions = event_policy_->Evict(tier_stats, target);
+            if (!actions.empty()) {
+                ExecuteActions(actions);
+            }
+        });
+    } catch (const std::exception&) {
+        evict_in_flight_.store(false, std::memory_order_relaxed);
+    }
+}
+
+double ClientScheduler::ComputeDynamicEvictWatermark(
+    double write_rate_bytes_per_sec, size_t capacity_bytes) const {
+    // Normalize write pressure against a capacity-per-second reference so the
+    // formula needs no workload-specific calibration: writing the whole tier in
+    // one second is treated as maximum pressure.
+    const double reference =
+        capacity_bytes > 0 ? static_cast<double>(capacity_bytes) : 1.0;
+    const double pressure =
+        std::clamp(write_rate_bytes_per_sec / reference, 0.0, 1.0);
+    // Low pressure → watermark near the upper bound; high pressure → floor.
+    double watermark = evict_watermark_ -
+                       (evict_watermark_ - evict_watermark_floor_) * pressure;
+    return std::clamp(watermark, evict_watermark_floor_,
+                      std::nextafter(limit_watermark_, 0.0));
+}
+
+size_t ClientScheduler::ComputeReclaimTarget(double usage_ratio,
+                                             double dynamic_watermark,
+                                             size_t capacity_bytes,
+                                             size_t used_bytes) const {
+    // Proportional control across the "danger zone" between the dynamic
+    // watermark and the hard limit: just over the watermark reclaims ~rate_min,
+    // approaching the limit reclaims ~rate_max. This avoids one-shot bulk
+    // eviction (which would cause usage jitter) while still reacting urgently
+    // when close to the ceiling.
+    const double danger_span = limit_watermark_ - dynamic_watermark;
+    const double danger =
+        danger_span > 0.0
+            ? std::clamp((usage_ratio - dynamic_watermark) / danger_span, 0.0,
+                         1.0)
+            : 1.0;
+    double fraction = evict_rate_min_ + (evict_rate_max_ - evict_rate_min_) *
+                                            evict_rate_gain_ * danger;
+    fraction = std::clamp(fraction, evict_rate_min_, evict_rate_max_);
+
+    const size_t target =
+        static_cast<size_t>(fraction * static_cast<double>(capacity_bytes));
+
+    // Never reclaim below the low watermark.
+    const size_t low_bytes = static_cast<size_t>(
+        low_watermark_ * static_cast<double>(capacity_bytes));
+    const size_t reclaimable =
+        used_bytes > low_bytes ? used_bytes - low_bytes : 0;
+    return std::min(target, reclaimable);
+}
+
 void ClientScheduler::WorkerLoop() {
     while (running_) {
         // Use condition_variable so Stop() can wake us immediately.
@@ -189,6 +591,13 @@ void ClientScheduler::WorkerLoop() {
                          [this] { return !running_.load(); });
         }
         if (!running_) break;
+
+        // Event-driven mode reacts to access events; the periodic loop only
+        // runs the background eviction controller (watermark + rate limiting).
+        if (event_policy_) {
+            RunBackgroundEvictCycle();
+            continue;
+        }
 
         // 1. Collect Stats
         auto access_stats = stats_collector_->GetSnapshot();

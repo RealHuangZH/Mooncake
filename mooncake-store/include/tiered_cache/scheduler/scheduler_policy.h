@@ -61,7 +61,12 @@ class SchedulerPolicy {
     virtual ~SchedulerPolicy() = default;
 
     /**
-     * @brief Core decision function
+     * @brief Core periodic decision function.
+     *
+     * Defaults to a no-op (empty plan) so event-driven policies that only
+     * react through the EventDrivenPolicy mixin do not need to implement it.
+     * Periodic reconciliation policies (Simple/LRU) override this.
+     *
      * @param tier_stats Current status of all managed tiers
      * @param active_keys List of active/hot keys with their context
      * @return List of recommended actions or an error when the policy cannot
@@ -69,7 +74,11 @@ class SchedulerPolicy {
      */
     virtual tl::expected<std::vector<SchedAction>, ErrorCode> Decide(
         const std::unordered_map<UUID, TierStats>& tier_stats,
-        const std::vector<KeyContext>& active_keys) = 0;
+        const std::vector<KeyContext>& active_keys) {
+        (void)tier_stats;
+        (void)active_keys;
+        return std::vector<SchedAction>{};
+    }
 
     /**
      * @brief Set the fast tier ID for the policy.
