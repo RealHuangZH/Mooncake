@@ -233,6 +233,33 @@ class TieredBackend {
      */
     tl::expected<long, ErrorCode> RemoveAll();
 
+    /**
+     * @brief Reverse-notification hook for a tier that autonomously evicted a
+     *        bucket.
+     *
+     * A StorageTier may evict a whole bucket (a small file holding several
+     * keys) on its own when the backing device runs out of space. That
+     * deletion originates at the lowest layer and bypasses the normal
+     * top-down RAII path, so the high-level metadata index and the scheduler
+     * cache would otherwise keep pointing at data that no longer exists --
+     * leaking zombie AllocationHandles (which would double-decrement the
+     * tier's live-byte counter on later release) and feeding the scheduler a
+     * phantom replica it may rely on to safely evict other tiers.
+     *
+     * For each evicted key this removes the replica that lives on @p tier_id
+     * from the metadata index (releasing its AllocationHandle OUTSIDE all
+     * locks, so ~AllocationEntry -> StorageTier::Free performs the single,
+     * authoritative decrement of the tier's live-byte counter), best-effort
+     * notifies the Master, and clears the scheduler cache. Keys that no longer
+     * have a replica on @p tier_id are skipped. Must be called by the tier
+     * AFTER the on-disk bucket has been removed.
+     *
+     * @param tier_id The tier whose bucket was evicted.
+     * @param keys    Snapshot of the keys that lived in the evicted bucket.
+     */
+    void NotifyBucketEviction(UUID tier_id,
+                              const std::vector<std::string>& keys);
+
     // --- Composite Operations ---
 
     tl::expected<void, ErrorCode> CopyData(

@@ -4,6 +4,7 @@
 #include <cstring>
 
 #include "tiered_cache/tiers/storage_tier.h"
+#include "tiered_cache/tiered_backend.h"
 #include "tiered_cache/copier_registry.h"
 #include "utils.h"
 
@@ -408,6 +409,41 @@ tl::expected<size_t, ErrorCode> StorageTier::TriggerBucketEviction(
     constexpr int MAX_EVICTION_ATTEMPTS = 10;  // Prevent infinite loop
     int attempts = 0;
 
+    // Evict a single bucket and keep the higher layers consistent.
+    auto evict_and_notify =
+        [&](int64_t bucket_id) -> tl::expected<size_t, ErrorCode> {
+        // Snapshot the bucket's keys BEFORE eviction wipes them, so the high
+        // layers can be told exactly which keys to forget.
+        std::vector<std::string> bucket_keys;
+        auto keys_res = bucket_backend->GetBucketKeys(bucket_id, bucket_keys);
+        if (!keys_res) {
+            return tl::make_unexpected(keys_res.error());
+        }
+
+        auto evict_res = bucket_backend->EvictBucket(bucket_id);
+        if (!evict_res) {
+            return tl::make_unexpected(evict_res.error());
+        }
+        size_t freed = evict_res.value();
+
+        // Reverse-notify the high layers (metadata index + scheduler + Master).
+        // Releasing each AllocationHandle there triggers StorageTier::Free,
+        // which is the SINGLE place that decrements persisted_live_data_bytes_
+        // for the key -- so we must NOT fetch_sub here as well (doing both
+        // double-counts and underflows the unsigned counter).
+        //
+        // Fallback: when this tier runs without a TieredBackend (e.g. a
+        // standalone unit test) there are no AllocationHandles to release, so
+        // account directly to keep the counter accurate.
+        if (backend_) {
+            backend_->NotifyBucketEviction(tier_id_, bucket_keys);
+        } else {
+            persisted_live_data_bytes_.fetch_sub(freed,
+                                                 std::memory_order_acq_rel);
+        }
+        return freed;
+    };
+
     // If target_free_size is 0, evict just one bucket
     if (target_free_size == 0) {
         auto select_res = bucket_backend->SelectBucketForEviction();
@@ -418,7 +454,7 @@ tl::expected<size_t, ErrorCode> StorageTier::TriggerBucketEviction(
         }
 
         int64_t bucket_id = select_res.value();
-        auto evict_res = bucket_backend->EvictBucket(bucket_id);
+        auto evict_res = evict_and_notify(bucket_id);
         if (!evict_res) {
             LOG(ERROR) << "Failed to evict bucket " << bucket_id << ": "
                        << evict_res.error();
@@ -426,11 +462,6 @@ tl::expected<size_t, ErrorCode> StorageTier::TriggerBucketEviction(
         }
 
         total_freed = evict_res.value();
-
-        // Update live persisted bytes to reflect cache-visible space freed by
-        // eviction.
-        persisted_live_data_bytes_.fetch_sub(total_freed,
-                                             std::memory_order_acq_rel);
 
         LOG(INFO) << "Evicted 1 bucket, freed " << total_freed << " bytes";
         return total_freed;
@@ -453,7 +484,7 @@ tl::expected<size_t, ErrorCode> StorageTier::TriggerBucketEviction(
         }
 
         int64_t bucket_id = select_res.value();
-        auto evict_res = bucket_backend->EvictBucket(bucket_id);
+        auto evict_res = evict_and_notify(bucket_id);
         if (!evict_res) {
             LOG(ERROR) << "Failed to evict bucket " << bucket_id << ": "
                        << evict_res.error();
@@ -465,10 +496,6 @@ tl::expected<size_t, ErrorCode> StorageTier::TriggerBucketEviction(
         size_t freed = evict_res.value();
         total_freed += freed;
         attempts++;
-
-        // Update live persisted bytes to reflect cache-visible space freed by
-        // eviction.
-        persisted_live_data_bytes_.fetch_sub(freed, std::memory_order_acq_rel);
 
         LOG(INFO) << "Evicted bucket " << bucket_id << ", freed " << freed
                   << " bytes (total: " << total_freed << "/" << target_free_size

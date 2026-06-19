@@ -825,6 +825,94 @@ tl::expected<void, ErrorCode> TieredBackend::Delete(std::string_view key,
     return tl::expected<void, ErrorCode>{};
 }
 
+void TieredBackend::NotifyBucketEviction(UUID tier_id,
+                                         const std::vector<std::string>& keys) {
+    // Captured handles are released only AFTER every lock has dropped, so that
+    // ~AllocationEntry -> StorageTier::Free runs lock-free. That Free is the
+    // SINGLE authoritative decrement of the tier's live-byte counter for each
+    // key -- the tier must therefore NOT also decrement directly, or the count
+    // underflows.
+    std::vector<AllocationHandle> handles_to_free;
+    handles_to_free.reserve(keys.size());
+
+    for (const auto& key : keys) {
+        auto& shard = GetMetadataShard(key);
+        AllocationHandle handle_ref = nullptr;
+        bool need_cleanup = false;
+
+        // Detach the replica that lives on the evicted tier (Shard Read Lock +
+        // Entry Write Lock), mirroring the single-replica path of Delete().
+        {
+            std::shared_lock<std::shared_mutex> read_lock(shard.mutex);
+            auto it = shard.index.find(key);
+            if (it == shard.index.end()) {
+                // Key already gone (e.g. deleted concurrently); its accounting
+                // was settled on that path.
+                continue;
+            }
+            auto entry = it->second;
+
+            std::unique_lock<std::shared_mutex> entry_write_lock(entry->mutex);
+            auto tier_it = entry->replicas.end();
+            for (auto rit = entry->replicas.begin();
+                 rit != entry->replicas.end(); ++rit) {
+                if (rit->first == tier_id) {
+                    tier_it = rit;
+                    break;
+                }
+            }
+            if (tier_it == entry->replicas.end()) {
+                // No replica on this tier (key only lives elsewhere); nothing
+                // for this reverse path to reclaim.
+                continue;
+            }
+
+            handle_ref = tier_it->second;  // +1 ref: keep alive past the locks
+            entry->replicas.erase(tier_it);
+            entry->version++;
+            need_cleanup = entry->replicas.empty();
+        }
+
+        // Drop the now-empty entry under a shard write lock (with
+        // double-check), exactly as Delete() does, to avoid leaking zombie
+        // entries.
+        if (need_cleanup) {
+            std::unique_lock<std::shared_mutex> write_lock(shard.mutex);
+            auto it = shard.index.find(key);
+            if (it != shard.index.end()) {
+                auto entry = it->second;
+                std::unique_lock<std::shared_mutex> entry_lock(entry->mutex);
+                if (entry->replicas.empty()) {
+                    shard.index.erase(it);
+                }
+            }
+        }
+
+        // Best-effort Master notification. The on-disk bucket is already gone,
+        // so a failure here cannot be rolled back -- log and continue (as
+        // RemoveAll does), rather than abort like the user-initiated Delete.
+        if (remove_replica_callback_) {
+            auto result = remove_replica_callback_(key, tier_id);
+            if (!result.has_value()) {
+                LOG(WARNING) << "NotifyBucketEviction: notify master failed"
+                             << ", key=" << key << ", tier_id=" << tier_id
+                             << ", error_code=" << result.error();
+            }
+        }
+
+        // Drop the scheduler's phantom replica so LRU / TryFastReclaim stop
+        // treating this tier as a safe backup for the key.
+        if (scheduler_) {
+            scheduler_->OnDelete(key, tier_id);
+        }
+
+        handles_to_free.push_back(std::move(handle_ref));
+    }
+
+    // handles_to_free destructs here -> ref count hits 0 -> ~AllocationEntry
+    // -> StorageTier::Free, lock-free, performing the per-key decrement.
+}
+
 tl::expected<long, ErrorCode> TieredBackend::RemoveAll() {
     if (is_shutting_down_.load(std::memory_order_acquire)) {
         LOG(ERROR) << "TieredBackend is shutting down";
