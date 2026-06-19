@@ -661,6 +661,110 @@ TEST_F(StorageTierTest, AutoEvictionOnCapacityExceeded) {
     fs::remove_all("/tmp/mooncake_test_auto_eviction");
 }
 
+// Regression test for the SSD bucket-eviction metadata/accounting bug.
+//
+// When a StorageTier evicts a whole bucket to reclaim space it must notify the
+// TieredBackend so the evicted keys' AllocationHandles are dropped from the
+// metadata index and the tier's live-byte counter is decremented exactly once.
+// Before the fix, eviction subtracted persisted_live_data_bytes_ directly while
+// leaving zombie handles in the index; releasing those handles later subtracted
+// the same bytes a second time (underflowing the unsigned counter), and the
+// evicted keys lingered in the metadata index forever.
+//
+// Both EXPECTs below pass with the fix and fail on the pre-fix code.
+TEST_F(StorageTierTest, EvictionPurgesMetadataAndKeepsUsageConsistent) {
+    fs::remove_all("/tmp/mooncake_test_evict_meta");
+    fs::create_directories("/tmp/mooncake_test_evict_meta");
+
+    setenv("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR",
+           "bucket_storage_backend", 1);
+    setenv("MOONCAKE_OFFLOAD_FILE_STORAGE_PATH",
+           "/tmp/mooncake_test_evict_meta", 1);
+
+    std::string json_config_str = R"({
+        "tiers": [
+            {
+                "type": "STORAGE",
+                "capacity": 20480,
+                "priority": 5,
+                "tags": ["ssd"]
+            }
+        ]
+    })";
+    Json::Value config;
+    ASSERT_TRUE(parseJsonString(json_config_str, config));
+
+    {
+        TieredBackend backend;
+        ASSERT_TRUE(InitTieredBackendForTest(backend, config).has_value());
+
+        constexpr int kNumKeys = 20;
+        constexpr size_t kValueSize = 1024;  // 20 * 1024 == capacity
+        std::vector<std::string> keys;
+        for (int i = 0; i < kNumKeys; ++i) {
+            std::string key = "evk_" + std::to_string(i);
+            keys.push_back(key);
+
+            auto alloc = backend.Allocate(kValueSize);
+            ASSERT_TRUE(alloc.has_value()) << "alloc failed for " << key;
+            AllocationHandle handle = alloc.value();
+
+            DataSource source;
+            source.buffer = std::make_unique<TempDRAMBuffer>(
+                CreateTestBuffer(kValueSize), kValueSize);
+            source.type = MemoryType::DRAM;
+            ASSERT_TRUE(backend.Write(source, handle).has_value());
+            ASSERT_TRUE(backend.Commit(key, handle).has_value());
+        }
+
+        // Persist everything so the keys live in evictable on-disk buckets.
+        auto tier_views = backend.GetTierViews();
+        ASSERT_FALSE(tier_views.empty());
+        const UUID tier_id = tier_views[0].id;
+        const_cast<CacheTier*>(backend.GetTier(tier_id))->Flush();
+
+        // Baseline: every key is indexed and usage equals the live bytes.
+        for (const auto& key : keys) {
+            EXPECT_TRUE(backend.Exist(key))
+                << "missing before eviction: " << key;
+        }
+        tier_views = backend.GetTierViews();
+        EXPECT_EQ(tier_views[0].usage, kNumKeys * kValueSize);
+
+        // Force eviction: an allocation that exceeds capacity evicts at least
+        // one whole bucket. The handle is released at scope end so the staging
+        // reservation does not skew the usage check below.
+        {
+            auto alloc = backend.Allocate(5 * kValueSize);
+            ASSERT_TRUE(alloc.has_value())
+                << "allocation should succeed after bucket eviction";
+        }
+
+        // (1) Evicted keys must be purged from the metadata index. With the bug
+        // they all still resolve as present (zombie handles never removed).
+        int still_present = 0;
+        for (const auto& key : keys) {
+            if (backend.Exist(key)) ++still_present;
+        }
+        EXPECT_LT(still_present, kNumKeys)
+            << "eviction did not purge any evicted key from the metadata index";
+
+        // (2) Deleting every original key releases all remaining handles. The
+        // live-byte counter must settle at zero -- not underflow. With the bug,
+        // the zombie handles' release double-subtracts and wraps the unsigned
+        // counter to an astronomical value.
+        for (const auto& key : keys) {
+            // OBJECT_NOT_FOUND for an already-evicted key is expected/ignored.
+            backend.Delete(key);
+        }
+        tier_views = backend.GetTierViews();
+        EXPECT_EQ(tier_views[0].usage, 0u)
+            << "live-byte accounting drifted/underflowed after eviction+delete";
+    }
+
+    fs::remove_all("/tmp/mooncake_test_evict_meta");
+}
+
 // ============================================================
 // Concurrency Tests
 // ============================================================
